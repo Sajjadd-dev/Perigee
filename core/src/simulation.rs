@@ -52,6 +52,14 @@ pub enum SimulationError {
     #[error("Invalid contract: {0}")]
     InvalidContract(String),
 
+    /// The supplied bytes are not a well-formed WASM module (BE-020).
+    ///
+    /// Raised by validation *before* the module reaches the Soroban host,
+    /// which panics rather than returning an error when handed malformed
+    /// input. The message names what was wrong and where.
+    #[error("Invalid WASM: {0}")]
+    InvalidWasm(String),
+
     #[error("Parse error: {0}")]
     ParseError(#[from] crate::parser::ParserError),
 
@@ -1066,6 +1074,85 @@ struct ConsensusFingerprint {
 }
 
 #[allow(dead_code)]
+// ── BE-019: protocol-versioned cost parameters ───────────────────────────────
+
+/// The newest protocol version this build knows cost parameters for.
+///
+/// Used when a request does not name a version, which is the common case:
+/// callers simulating against current mainnet should not have to say so.
+pub const LATEST_PROTOCOL_VERSION: u32 = 23;
+
+/// The oldest protocol version this build knows cost parameters for.
+///
+/// Older protocols are refused rather than costed against modern parameters —
+/// a wrong number presented confidently is worse than an explicit refusal,
+/// and silently doing that is the bug BE-019 describes.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 20;
+
+/// Cost parameters for one protocol version (BE-019).
+///
+/// Each field is how many resource units make up one stroop of cost, so a
+/// larger divisor means a cheaper resource.
+///
+/// **On the values.** The authoritative figures live on-chain, in the
+/// network's config-settings ledger entries, and change with protocol
+/// upgrades. The table below carries the parameters this engine has always
+/// applied; they are not independently sourced per-protocol figures, and none
+/// are invented here. What changes is that parameters are now *selected* by
+/// version rather than hardcoded at the call site — so recording a genuine
+/// difference for a future protocol is a table edit, and asking for a
+/// protocol this build does not know is an error rather than a silently
+/// mis-costed result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolCostParameters {
+    pub protocol_version: u32,
+    pub cpu_instructions_per_stroop: u64,
+    pub ram_bytes_per_stroop: u64,
+    pub ledger_bytes_per_stroop: u64,
+}
+
+impl ProtocolCostParameters {
+    /// Parameters for `protocol_version`.
+    ///
+    /// # Errors
+    /// * `InvalidContract` — the version is outside the supported range
+    pub fn for_protocol(protocol_version: u32) -> Result<Self, SimulationError> {
+        if !(MIN_SUPPORTED_PROTOCOL_VERSION..=LATEST_PROTOCOL_VERSION).contains(&protocol_version) {
+            return Err(SimulationError::InvalidContract(format!(
+                "protocol version {protocol_version} is not supported; this build knows \
+                 cost parameters for {MIN_SUPPORTED_PROTOCOL_VERSION}..={LATEST_PROTOCOL_VERSION}"
+            )));
+        }
+
+        Ok(Self {
+            protocol_version,
+            cpu_instructions_per_stroop: 10_000,
+            ram_bytes_per_stroop: 1_024,
+            ledger_bytes_per_stroop: 1_024,
+        })
+    }
+
+    /// Parameters for the requested version, or the latest when unspecified.
+    pub fn resolve(protocol_version: Option<u32>) -> Result<Self, SimulationError> {
+        Self::for_protocol(protocol_version.unwrap_or(LATEST_PROTOCOL_VERSION))
+    }
+
+    /// Cost in stroops of the given resources under these parameters.
+    pub fn cost_of(&self, resources: &SorobanResources) -> u64 {
+        let cpu_cost = resources.cpu_instructions / self.cpu_instructions_per_stroop;
+        let ram_cost = resources.ram_bytes / self.ram_bytes_per_stroop;
+
+        let ledger_bytes = resources
+            .ledger_read_bytes
+            .saturating_add(resources.ledger_write_bytes);
+        let ledger_cost = ledger_bytes / self.ledger_bytes_per_stroop;
+
+        cpu_cost
+            .saturating_add(ram_cost)
+            .saturating_add(ledger_cost)
+    }
+}
+
 impl SimulationEngine {
     const TTL_WARNING_THRESHOLD_LEDGERS: i64 = 120_000;
     const TTL_TARGET_LEDGERS_AHEAD: i64 = 360_000;
@@ -2219,8 +2306,8 @@ impl SimulationEngine {
                 other => SimulationError::RpcRequestFailed(other.to_string()),
             })?;
 
-        let rpc_response: SimulateTransactionResponse = serde_json::from_value(raw)
-            .map_err(|e| {
+        let rpc_response: SimulateTransactionResponse =
+            serde_json::from_value(raw).map_err(|e| {
                 SimulationError::RpcRequestFailed(format!("Failed to parse response: {e}"))
             })?;
 
@@ -2463,8 +2550,9 @@ impl SimulationEngine {
             .await
             .map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
 
-        let rpc_response: GetLedgerEntriesResponse = serde_json::from_value(raw)
-            .map_err(|e| SimulationError::RpcRequestFailed(format!("Failed to parse response: {e}")))?;
+        let rpc_response: GetLedgerEntriesResponse = serde_json::from_value(raw).map_err(|e| {
+            SimulationError::RpcRequestFailed(format!("Failed to parse response: {e}"))
+        })?;
 
         let fetched_entries = match rpc_response.result {
             LedgerEntriesResponseResult::Success { result } => result.entries,
@@ -2668,16 +2756,29 @@ impl SimulationEngine {
         }
     }
 
+    /// Cost in stroops under the latest known protocol.
+    ///
+    /// Retained for callers that have no protocol version to hand — notably
+    /// the RPC path, where the version is not threaded through. Prefer
+    /// [`calculate_cost_for_protocol`](Self::calculate_cost_for_protocol)
+    /// wherever a version is available.
     pub(crate) fn calculate_cost(&self, resources: &SorobanResources) -> u64 {
-        let cpu_cost = resources.cpu_instructions / 10000;
-        let ram_cost = resources.ram_bytes / 1024;
-        let ledger_bytes = resources
-            .ledger_read_bytes
-            .saturating_add(resources.ledger_write_bytes);
-        let ledger_cost = ledger_bytes / 1024;
-        cpu_cost
-            .saturating_add(ram_cost)
-            .saturating_add(ledger_cost)
+        ProtocolCostParameters::for_protocol(LATEST_PROTOCOL_VERSION)
+            .expect("the latest protocol version is always in the table")
+            .cost_of(resources)
+    }
+
+    /// Cost in stroops under `protocol_version`, or the latest when `None`
+    /// (BE-019).
+    ///
+    /// # Errors
+    /// * `InvalidContract` — the version is outside the supported range
+    pub(crate) fn calculate_cost_for_protocol(
+        &self,
+        resources: &SorobanResources,
+        protocol_version: Option<u32>,
+    ) -> Result<u64, SimulationError> {
+        Ok(ProtocolCostParameters::resolve(protocol_version)?.cost_of(resources))
     }
 
     /// Create invoke transaction for contract call
@@ -2810,10 +2911,17 @@ impl SimulationEngine {
         function_name: &str,
         args: Vec<String>,
         overrides: HashMap<String, String>,
-        _protocol_version: Option<u32>,
+        protocol_version: Option<u32>,
         _enable_experimental: Option<bool>,
     ) -> Result<SimulationResult, SimulationError> {
+        // BE-019: this parameter used to be discarded, so a caller could ask
+        // for a protocol version and be costed against a different one without
+        // being told. Resolving it here rejects an unsupported version up
+        // front rather than after the simulation has run.
+        let cost_parameters = ProtocolCostParameters::resolve(protocol_version)?;
+
         tracing::info!(
+            protocol_version = cost_parameters.protocol_version,
             "Running local simulation with {} overrides",
             overrides.len()
         );
@@ -2845,6 +2953,15 @@ impl SimulationEngine {
         // We first run a normal simulation to get the baseline resources and the footprint.
         let transaction_xdr = self.create_invoke_transaction(contract_id, function_name, args)?;
         let mut result = self.simulate_transaction(&transaction_xdr).await?;
+
+        // BE-019: `simulate_transaction` costs against the default parameters,
+        // because the RPC path has no protocol version in scope. Re-cost here,
+        // where the caller's requested version is known, and report which
+        // version the figure belongs to — it previously came back as 0, which
+        // is not a protocol version at all.
+        result.cost_stroops =
+            self.calculate_cost_for_protocol(&result.resources, protocol_version)?;
+        result.protocol_version = cost_parameters.protocol_version;
 
         // Merge state dependency report:
         // 1. Mark injected entries
@@ -3823,8 +3940,7 @@ mod tests {
     #[test]
     fn test_parse_contract_id_valid() {
         let engine = SimulationEngine::new("https://test.com".to_string());
-        let result =
-            engine.parse_contract_id(TESTNET_DEFAULT_CONTRACT_ID);
+        let result = engine.parse_contract_id(TESTNET_DEFAULT_CONTRACT_ID);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 32);
     }
@@ -4448,5 +4564,168 @@ mod tests {
         assert!(result.is_ok(), "wrapper should succeed");
         let count = result.unwrap().get_payload() >> 8;
         assert!(count > 0, "counter should be > 0, got {count}");
+    }
+}
+
+#[cfg(test)]
+mod protocol_cost_tests {
+    use super::*;
+
+    fn resources() -> SorobanResources {
+        SorobanResources {
+            cpu_instructions: 100_000,
+            ram_bytes: 4_096,
+            ledger_read_bytes: 1_024,
+            ledger_write_bytes: 1_024,
+            transaction_size_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn an_unspecified_version_resolves_to_the_latest() {
+        let resolved = ProtocolCostParameters::resolve(None).unwrap();
+
+        assert_eq!(resolved.protocol_version, LATEST_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn a_specified_version_is_honoured() {
+        for version in MIN_SUPPORTED_PROTOCOL_VERSION..=LATEST_PROTOCOL_VERSION {
+            let resolved = ProtocolCostParameters::resolve(Some(version)).unwrap();
+
+            assert_eq!(resolved.protocol_version, version);
+        }
+    }
+
+    /// The behaviour the issue is about: an unknown protocol must be refused
+    /// rather than costed against whatever parameters happen to be compiled
+    /// in. A confidently wrong number is worse than an error.
+    #[test]
+    fn an_unsupported_version_is_refused_with_the_supported_range() {
+        for version in [
+            0,
+            1,
+            MIN_SUPPORTED_PROTOCOL_VERSION - 1,
+            LATEST_PROTOCOL_VERSION + 1,
+            999,
+        ] {
+            let err = ProtocolCostParameters::for_protocol(version).unwrap_err();
+
+            let msg = err.to_string();
+            assert!(msg.contains(&version.to_string()), "{msg}");
+            assert!(
+                msg.contains(&MIN_SUPPORTED_PROTOCOL_VERSION.to_string())
+                    && msg.contains(&LATEST_PROTOCOL_VERSION.to_string()),
+                "the message should name the supported range: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_supported_range_is_non_empty_and_ordered() {
+        assert!(MIN_SUPPORTED_PROTOCOL_VERSION <= LATEST_PROTOCOL_VERSION);
+        assert!(ProtocolCostParameters::for_protocol(LATEST_PROTOCOL_VERSION).is_ok());
+        assert!(ProtocolCostParameters::for_protocol(MIN_SUPPORTED_PROTOCOL_VERSION).is_ok());
+    }
+
+    #[test]
+    fn cost_is_the_sum_of_the_three_resource_classes() {
+        let params = ProtocolCostParameters::for_protocol(LATEST_PROTOCOL_VERSION).unwrap();
+        let r = resources();
+
+        // 100_000/10_000 + 4_096/1_024 + (1_024+1_024)/1_024 = 10 + 4 + 2
+        assert_eq!(params.cost_of(&r), 16);
+    }
+
+    #[test]
+    fn zero_resources_cost_nothing() {
+        let params = ProtocolCostParameters::resolve(None).unwrap();
+
+        assert_eq!(params.cost_of(&SorobanResources::default()), 0);
+    }
+
+    /// Ledger read and write bytes are charged together, so moving bytes
+    /// between the two must not change the total.
+    #[test]
+    fn ledger_reads_and_writes_are_charged_at_the_same_rate() {
+        let params = ProtocolCostParameters::resolve(None).unwrap();
+
+        let read_heavy = SorobanResources {
+            ledger_read_bytes: 2_048,
+            ledger_write_bytes: 0,
+            ..Default::default()
+        };
+        let write_heavy = SorobanResources {
+            ledger_read_bytes: 0,
+            ledger_write_bytes: 2_048,
+            ..Default::default()
+        };
+
+        assert_eq!(params.cost_of(&read_heavy), params.cost_of(&write_heavy));
+    }
+
+    #[test]
+    fn a_huge_resource_count_saturates_rather_than_overflowing() {
+        let params = ProtocolCostParameters::resolve(None).unwrap();
+
+        let enormous = SorobanResources {
+            cpu_instructions: u64::MAX,
+            ram_bytes: u64::MAX,
+            ledger_read_bytes: u64::MAX,
+            ledger_write_bytes: u64::MAX,
+            transaction_size_bytes: u64::MAX,
+        };
+
+        // The point is that this returns rather than panicking under the
+        // release profile's overflow checks.
+        let cost = params.cost_of(&enormous);
+        assert!(cost > 0);
+    }
+
+    /// The parameters are currently identical across the supported range —
+    /// this build does not invent per-protocol figures it cannot source. The
+    /// test records that, so that introducing a genuine difference is a
+    /// deliberate edit here rather than an accident.
+    #[test]
+    fn parameters_are_currently_uniform_across_supported_protocols() {
+        let baseline = ProtocolCostParameters::for_protocol(LATEST_PROTOCOL_VERSION).unwrap();
+
+        for version in MIN_SUPPORTED_PROTOCOL_VERSION..=LATEST_PROTOCOL_VERSION {
+            let params = ProtocolCostParameters::for_protocol(version).unwrap();
+
+            assert_eq!(
+                params.cpu_instructions_per_stroop,
+                baseline.cpu_instructions_per_stroop
+            );
+            assert_eq!(params.ram_bytes_per_stroop, baseline.ram_bytes_per_stroop);
+            assert_eq!(
+                params.ledger_bytes_per_stroop,
+                baseline.ledger_bytes_per_stroop
+            );
+        }
+    }
+
+    #[test]
+    fn the_engine_costs_identically_through_both_entry_points() {
+        let engine = SimulationEngine::new("https://test.example".to_string());
+        let r = resources();
+
+        let via_default = engine.calculate_cost(&r);
+        let via_version = engine
+            .calculate_cost_for_protocol(&r, Some(LATEST_PROTOCOL_VERSION))
+            .unwrap();
+        let via_none = engine.calculate_cost_for_protocol(&r, None).unwrap();
+
+        assert_eq!(via_default, via_version);
+        assert_eq!(via_default, via_none);
+    }
+
+    #[test]
+    fn the_engine_rejects_an_unsupported_protocol() {
+        let engine = SimulationEngine::new("https://test.example".to_string());
+
+        assert!(engine
+            .calculate_cost_for_protocol(&resources(), Some(999))
+            .is_err());
     }
 }

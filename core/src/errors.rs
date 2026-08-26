@@ -204,6 +204,11 @@ impl From<SimulationError> for AppError {
             SimulationError::InvalidContract(msg) => {
                 AppError::BadRequest(format!("Invalid contract: {}", msg))
             }
+            // BE-020: malformed WASM is the caller's input, so 400 rather than
+            // 500, and the message says what was wrong with it.
+            SimulationError::InvalidWasm(msg) => {
+                AppError::BadRequest(format!("Invalid WASM: {}", msg))
+            }
             SimulationError::ParseError(e) => {
                 AppError::BadRequest(format!("Argument parse error: {}", e))
             }
