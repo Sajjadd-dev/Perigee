@@ -585,6 +585,29 @@ impl EmergencyGuard {
     }
 }
 
+/// Standard emergency-guard surface for host contracts embedding `EmergencyGuard` storage.
+pub trait EmergencyGuardTrait {
+    fn check_not_paused(env: &Env, operation: u32) -> Result<(), GuardError>;
+    fn get_pause_state(env: &Env) -> u32;
+    fn set_pause_state(env: &Env, operation: u32, paused: bool) -> Result<(), GuardError>;
+    fn unpause(env: &Env, operation: u32) -> Result<(), GuardError>;
+    fn unpause_all(env: &Env) -> Result<(), GuardError>;
+    fn emergency_pause_all(env: &Env, approvers: Vec<Address>) -> Result<(), GuardError>;
+    fn resume_all(env: &Env, approvers: Vec<Address>) -> Result<(), GuardError>;
+    fn init_guard(env: &Env, admins: Vec<Address>, threshold: u32) -> Result<(), GuardError>;
+    fn add_admin(env: &Env, approvers: Vec<Address>, new_admin: Address) -> Result<(), GuardError>;
+    fn remove_admin(env: &Env, approvers: Vec<Address>, admin: Address) -> Result<(), GuardError>;
+    fn rotate_admin(
+        env: &Env,
+        approvers: Vec<Address>,
+        old_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), GuardError>;
+    fn get_admins(env: &Env) -> Vec<Address>;
+    fn get_threshold(env: &Env) -> u32;
+    fn is_admin(env: &Env, addr: Address) -> bool;
+}
+
 /// Default implementation of EmergencyGuardTrait using static methods
 pub struct DefaultEmergencyGuard;
 
@@ -881,30 +904,6 @@ pub trait TokenEmergencyGuardTrait {
 
 #[cfg(test)]
 mod test;
-
-pub trait EmergencyGuardTrait {
-    fn check_not_paused(env: &Env, operation: u32) -> Result<(), GuardError>;
-    fn get_pause_state(env: &Env) -> u32;
-    fn set_pause_state(env: &Env, operation: u32, paused: bool) -> Result<(), GuardError>;
-    fn unpause(env: &Env, operation: u32) -> Result<(), GuardError>;
-    fn unpause_all(env: &Env) -> Result<(), GuardError>;
-    fn emergency_pause_all(env: &Env, approvers: Vec<Address>) -> Result<(), GuardError>;
-    fn resume_all(env: &Env, approvers: Vec<Address>) -> Result<(), GuardError>;
-    fn init_guard(env: &Env, admins: Vec<Address>, threshold: u32) -> Result<(), GuardError>;
-    fn add_admin(env: &Env, approvers: Vec<Address>, new_admin: Address) -> Result<(), GuardError>;
-    fn remove_admin(env: &Env, approvers: Vec<Address>, admin: Address) -> Result<(), GuardError>;
-    fn rotate_admin(
-        env: &Env,
-        approvers: Vec<Address>,
-        old_admin: Address,
-        new_admin: Address,
-    ) -> Result<(), GuardError>;
-    fn get_admins(env: &Env) -> Vec<Address>;
-    fn get_threshold(env: &Env) -> u32;
-    fn is_admin(env: &Env, addr: Address) -> bool;
-}
-
-pub struct DefaultEmergencyGuard;
 
 impl DefaultEmergencyGuard {
     pub fn check_not_paused(env: &Env, operation: u32) -> Result<(), GuardError> {
