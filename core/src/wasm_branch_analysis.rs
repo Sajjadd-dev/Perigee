@@ -620,11 +620,104 @@ fn fingerprint(r: &SorobanResources) -> ResourceFingerprint {
 /// * `wasm_bytes`     – Raw (not base-64-encoded) WASM binary.
 /// * `function_name`  – Exported Soroban function to analyse.
 /// * `args`           – Baseline argument vector (may be empty).
+/// The four magic bytes every WASM module starts with: `\0asm`.
+const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6d];
+
+/// The only module format version defined by the spec.
+const WASM_VERSION: u32 = 1;
+
+/// Bytes in a module header: 4 magic + 4 version.
+const WASM_HEADER_LEN: usize = 8;
+
+/// Check that `wasm` is a structurally well-formed module (BE-020).
+///
+/// This runs *before* the bytes reach the Soroban host. The host does not
+/// return an error for malformed input — it panics, and `soroban-sdk`
+/// unwraps that panic — so by the time the host sees bad bytes it is already
+/// too late to produce a useful message. Validating here is what turns a
+/// crashed request into a 400 with a reason.
+///
+/// The check is deliberately structural, not semantic: header, then a walk
+/// over the section table confirming every declared section length actually
+/// fits inside the module. It does not attempt to validate instruction
+/// encodings or types — that is the host's job, and duplicating it here would
+/// be a second implementation to keep in sync.
+pub fn validate_wasm(wasm: &[u8]) -> Result<(), SimulationError> {
+    if wasm.is_empty() {
+        return Err(SimulationError::InvalidWasm(
+            "input is empty; expected a WASM module".to_string(),
+        ));
+    }
+
+    if wasm.len() < WASM_HEADER_LEN {
+        return Err(SimulationError::InvalidWasm(format!(
+            "input is truncated: {} byte(s), but a module header needs {}",
+            wasm.len(),
+            WASM_HEADER_LEN
+        )));
+    }
+
+    if wasm[..4] != WASM_MAGIC {
+        return Err(SimulationError::InvalidWasm(format!(
+            "not a WASM module: expected magic bytes 00 61 73 6d, found {:02x} {:02x} {:02x} {:02x}",
+            wasm[0], wasm[1], wasm[2], wasm[3]
+        )));
+    }
+
+    let version = u32::from_le_bytes([wasm[4], wasm[5], wasm[6], wasm[7]]);
+
+    if version != WASM_VERSION {
+        return Err(SimulationError::InvalidWasm(format!(
+            "unsupported WASM version {version}, expected {WASM_VERSION}"
+        )));
+    }
+
+    // Walk the section table. Every section declares its own length, so a
+    // truncated or corrupt module shows up as a length that runs past the end
+    // of the input.
+    let mut scanner = Scanner::new(&wasm[WASM_HEADER_LEN..]);
+    let mut section_index = 0usize;
+
+    while scanner.remaining() > 0 {
+        let section_id = scanner.read_byte().ok_or_else(|| {
+            SimulationError::InvalidWasm(format!(
+                "truncated after section {section_index}: expected a section id"
+            ))
+        })?;
+
+        let declared_len = scanner.read_leb128_u32().ok_or_else(|| {
+            SimulationError::InvalidWasm(format!(
+                "section {section_index} (id {section_id}) has an unreadable length"
+            ))
+        })? as usize;
+
+        if declared_len > scanner.remaining() {
+            return Err(SimulationError::InvalidWasm(format!(
+                "section {} (id {}) declares {} byte(s) but only {} remain",
+                section_index,
+                section_id,
+                declared_len,
+                scanner.remaining()
+            )));
+        }
+
+        scanner.skip(declared_len);
+        section_index += 1;
+    }
+
+    Ok(())
+}
+
 pub fn analyze_wasm_branches(
     wasm_bytes: Vec<u8>,
     function_name: String,
     args: Vec<String>,
 ) -> Result<WasmBranchAnalysisResult, SimulationError> {
+    // BE-020: reject malformed input before the Soroban host sees it. The host
+    // panics on bad WASM rather than returning an error, so this is the only
+    // place a descriptive message can still be produced.
+    validate_wasm(&wasm_bytes)?;
+
     // ── 1. Static analysis ────────────────────────────────────────────────────
     let (total_branch_count, max_nesting_depth, branch_type_breakdown, branches) =
         match extract_function_body(&wasm_bytes, &function_name) {
@@ -654,13 +747,29 @@ pub fn analyze_wasm_branches(
     };
 
     // ── 2. Baseline simulation ────────────────────────────────────────────────
-    let baseline_resources = profile_contract(
-        wasm_bytes.clone(),
-        function_name.clone(),
-        args.clone(),
-        None,
-        None,
-    )?;
+    //
+    // The permutation loop below already guards against host panics, but this
+    // baseline call did not — so a module that passes structural validation
+    // and still upsets the host took the process down here. Structural
+    // validation cannot catch everything the host rejects, so this stays as a
+    // second line of defence rather than as the primary one.
+    let baseline_resources = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        profile_contract(
+            wasm_bytes.clone(),
+            function_name.clone(),
+            args.clone(),
+            None,
+            None,
+        )
+    })) {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(SimulationError::InvalidWasm(format!(
+                "the Soroban host rejected this module while profiling `{function_name}`; \
+                 it is structurally well-formed but not loadable"
+            )))
+        }
+    };
 
     // ── 3. Multi-path dynamic exploration ────────────────────────────────────
     let variations = generate_arg_variations(&args);
@@ -1140,5 +1249,202 @@ mod tests {
             "should detect the early return"
         );
         assert!(acc.max_depth >= 1);
+    }
+}
+
+#[cfg(test)]
+mod wasm_validation_tests {
+    use super::*;
+
+    /// A minimal but structurally valid module: header plus one empty
+    /// custom section (id 0, length 0).
+    fn valid_module() -> Vec<u8> {
+        vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
+    }
+
+    fn header_only() -> Vec<u8> {
+        vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
+    }
+
+    fn message(result: Result<(), SimulationError>) -> String {
+        match result {
+            Err(SimulationError::InvalidWasm(msg)) => msg,
+            other => panic!("expected InvalidWasm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_header_only_module_is_valid() {
+        assert!(validate_wasm(&header_only()).is_ok());
+    }
+
+    #[test]
+    fn a_module_with_a_well_formed_section_is_valid() {
+        assert!(validate_wasm(&valid_module()).is_ok());
+    }
+
+    #[test]
+    fn empty_input_is_rejected() {
+        assert!(message(validate_wasm(&[])).contains("empty"));
+    }
+
+    /// The case BE-020 names explicitly.
+    #[test]
+    fn a_truncated_binary_is_rejected_with_its_length() {
+        // The first five bytes of a real module — magic plus one version byte.
+        let truncated = vec![0x00, 0x61, 0x73, 0x6d, 0x01];
+
+        let msg = message(validate_wasm(&truncated));
+
+        assert!(msg.contains("truncated"), "{msg}");
+        assert!(
+            msg.contains('5'),
+            "the message should name the length: {msg}"
+        );
+    }
+
+    #[test]
+    fn every_truncation_of_a_valid_module_is_rejected_or_accepted_deliberately() {
+        let full = valid_module();
+
+        // Any prefix shorter than the header must be refused, and none may
+        // panic — the whole point of the issue.
+        for len in 0..WASM_HEADER_LEN {
+            assert!(
+                validate_wasm(&full[..len]).is_err(),
+                "a {len}-byte prefix should not validate"
+            );
+        }
+
+        // A prefix that keeps the header but cuts a section short must also
+        // be refused rather than silently accepted.
+        assert!(validate_wasm(&full[..full.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn non_wasm_bytes_are_rejected_with_the_bytes_found() {
+        let msg = message(validate_wasm(&[
+            0xde, 0xad, 0xbe, 0xef, 0x01, 0x00, 0x00, 0x00,
+        ]));
+
+        assert!(msg.contains("magic"), "{msg}");
+        assert!(
+            msg.contains("de"),
+            "the message should show what was found: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_version_is_rejected() {
+        let mut wasm = header_only();
+        wasm[4] = 0x02; // version 2
+
+        let msg = message(validate_wasm(&wasm));
+
+        assert!(msg.contains("version"), "{msg}");
+        assert!(msg.contains('2'), "{msg}");
+    }
+
+    /// A section that claims more bytes than the module contains is the
+    /// classic corrupt-upload shape, and the one most likely to make a naive
+    /// parser read past the end.
+    #[test]
+    fn a_section_longer_than_the_module_is_rejected() {
+        let mut wasm = header_only();
+        wasm.push(0x0a); // section id 10 (code)
+        wasm.push(0x7f); // declares 127 bytes
+        wasm.extend_from_slice(&[0x00, 0x00]); // but only 2 follow
+
+        let msg = message(validate_wasm(&wasm));
+
+        assert!(msg.contains("declares"), "{msg}");
+        assert!(msg.contains("127"), "{msg}");
+    }
+
+    #[test]
+    fn a_section_id_with_no_length_is_rejected() {
+        let mut wasm = header_only();
+        wasm.push(0x0a); // a section id, and nothing after it
+
+        assert!(message(validate_wasm(&wasm)).contains("unreadable length"));
+    }
+
+    /// The regression that matters: none of these may panic. Before BE-020
+    /// every one of them took the process down inside the Soroban host.
+    #[test]
+    fn malformed_input_never_panics() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0x00],
+            vec![0xde, 0xad, 0xbe, 0xef],
+            b"\0asm".to_vec(),
+            header_only(),
+            {
+                let mut v = header_only();
+                v.extend_from_slice(&[0xff; 4]); // unterminated LEB-128 length
+                v
+            },
+            {
+                let mut v = header_only();
+                v.extend_from_slice(&[0x01, 0xff, 0xff, 0xff, 0xff, 0x0f]); // huge length
+                v
+            },
+            vec![0xff; 1024],
+        ];
+
+        for (i, bytes) in cases.into_iter().enumerate() {
+            let outcome = std::panic::catch_unwind(|| validate_wasm(&bytes));
+
+            assert!(outcome.is_ok(), "case {i} panicked instead of returning");
+        }
+    }
+
+    /// Validation runs before any host interaction, so `analyze_wasm_branches`
+    /// surfaces the error rather than crashing.
+    #[test]
+    fn analysis_rejects_malformed_wasm_without_panicking() {
+        // Eight bytes, so it clears the length check and reaches the magic
+        // check — the point being which error comes back, not that one does.
+        let outcome = std::panic::catch_unwind(|| {
+            analyze_wasm_branches(
+                vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x00, 0x00, 0x00],
+                "noop".to_string(),
+                vec![],
+            )
+        });
+
+        match outcome {
+            Ok(Err(SimulationError::InvalidWasm(msg))) => assert!(msg.contains("magic"), "{msg}"),
+            Ok(other) => panic!("expected InvalidWasm, got {other:?}"),
+            Err(_) => panic!("analysis panicked on malformed WASM"),
+        }
+    }
+
+    #[test]
+    fn analysis_rejects_a_truncated_binary_without_panicking() {
+        let outcome = std::panic::catch_unwind(|| {
+            analyze_wasm_branches(
+                vec![0x00, 0x61, 0x73, 0x6d, 0x01],
+                "noop".to_string(),
+                vec![],
+            )
+        });
+
+        match outcome {
+            Ok(Err(SimulationError::InvalidWasm(msg))) => {
+                assert!(msg.contains("truncated"), "{msg}")
+            }
+            Ok(other) => panic!("expected InvalidWasm, got {other:?}"),
+            Err(_) => panic!("analysis panicked on a truncated binary"),
+        }
+    }
+
+    /// Malformed input is the caller's fault, so it must surface as a 400.
+    #[test]
+    fn malformed_wasm_maps_to_a_bad_request() {
+        let app_err: crate::errors::AppError =
+            SimulationError::InvalidWasm("truncated".to_string()).into();
+
+        assert!(matches!(app_err, crate::errors::AppError::BadRequest(_)));
     }
 }
